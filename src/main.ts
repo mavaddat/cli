@@ -3,6 +3,7 @@ import * as exec from '@actions/exec';
 import * as io from '@actions/io';
 import * as os from 'os';
 import * as path from 'path';
+import * as crypto from 'crypto';
 const util = require('util');
 const cpExec = util.promisify(require('child_process').exec);
 
@@ -10,14 +11,20 @@ import { createScriptFile, TEMP_DIRECTORY, NullOutstreamStringWritable, deleteFi
 
 const START_SCRIPT_EXECUTION_MARKER: string = "Starting script execution via docker image mcr.microsoft.com/azure-cli:";
 const AZ_CLI_VERSION_DEFAULT_VALUE = 'agentazcliversion'
+const prefix = !!process.env.AZURE_HTTP_USER_AGENT ? `${process.env.AZURE_HTTP_USER_AGENT}` : "";
+const AZ_CLI_TAG_lIST_URL = "https://mcr.microsoft.com/v2/azure-cli/tags/list";
 
 export async function main() {
+    let usrAgentRepo = crypto.createHash('sha256').update(`${process.env.GITHUB_REPOSITORY}`).digest('hex');
+    let actionName = 'AzureCLIAction';
+    let userAgentString = (!!prefix ? `${prefix}+` : '') + `GITHUBACTIONS/${actionName}@v2_${usrAgentRepo}_${process.env.RUNNER_ENVIRONMENT}_${process.env.GITHUB_RUN_ID}`;
+    process.env.AZURE_HTTP_USER_AGENT = userAgentString;
+
     var scriptFileName: string = '';
     const CONTAINER_NAME = `MICROSOFT_AZURE_CLI_${getCurrentTime()}_CONTAINER`;
     try {
         if (process.env.RUNNER_OS != 'Linux') {
-            core.setFailed('Please use Linux based OS as a runner.');
-            return;
+            throw new Error('Please use Linux-based OS as a runner.');
         }
 
         let inlineScript: string = core.getInput('inlineScript', { required: true });
@@ -25,12 +32,8 @@ export async function main() {
 
         if (azcliversion == AZ_CLI_VERSION_DEFAULT_VALUE) {
             try {
-                const { stdout, stderr } = await cpExec('az version');
-                if (!stderr) {
-                    azcliversion = JSON.parse(stdout)["azure-cli"]
-                } else {
-                    throw stderr
-                }
+                const { stdout } = await cpExec('az version');
+                azcliversion = JSON.parse(stdout)["azure-cli"]
             } catch (err) {
                 console.log('Failed to fetch az cli version from agent. Reverting back to latest.')
                 azcliversion = 'latest'
@@ -38,8 +41,8 @@ export async function main() {
         }
 
         if (!(await checkIfValidCLIVersion(azcliversion))) {
-            core.error('Please enter a valid azure cli version. \nSee available versions: https://github.com/Azure/azure-cli/releases.');
-            throw new Error('Please enter a valid azure cli version. \nSee available versions: https://github.com/Azure/azure-cli/releases.')
+            core.error('Please enter a valid azure cli version. \nSee available versions: https://github.com/Azure/azure-cli/releases');
+            throw new Error('Please enter a valid azure cli version. \nSee available versions: https://github.com/Azure/azure-cli/releases')
         }
 
         if (!inlineScript.trim()) {
@@ -49,16 +52,19 @@ export async function main() {
         inlineScript = ` set -e >&2; echo '${START_SCRIPT_EXECUTION_MARKER}' >&2; ${inlineScript}`;
         scriptFileName = await createScriptFile(inlineScript);
 
+        const hostAzureConfigDir = process.env.AZURE_CONFIG_DIR || path.join(process.env.HOME, '.azure');
+        const containerAzureConfigDir = '/root/.azure';
+        
         /*
         For the docker run command, we are doing the following
         - Set the working directory for docker continer
         - volume mount the GITHUB_WORKSPACE env variable (path where users checkout code is present) to work directory of container
-        - voulme mount .azure session token file between host and container,
+        - volume mount Azure config directory between host and container,
         - volume mount temp directory between host and container, inline script file is created in temp directory
         */
         let args: string[] = ["run", "--workdir", `${process.env.GITHUB_WORKSPACE}`,
             "-v", `${process.env.GITHUB_WORKSPACE}:${process.env.GITHUB_WORKSPACE}`,
-            "-v", `${process.env.HOME}/.azure:/root/.azure`,
+            "-v", `${hostAzureConfigDir}:${containerAzureConfigDir}`,
             "-v", `${TEMP_DIRECTORY}:${TEMP_DIRECTORY}`
         ];
         for (let key in process.env) {
@@ -96,28 +102,27 @@ const checkIfValidCLIVersion = async (azcliversion: string): Promise<boolean> =>
 }
 
 const getAllAzCliVersions = async (): Promise<Array<string>> => {
-    var outStream: string = '';
-    var execOptions: any = {
-        outStream: new NullOutstreamStringWritable({ decodeStrings: false }),
-        listeners: {
-            stdout: (data: any) => outStream += data.toString() + os.EOL, //outstream contains the list of all the az cli versions
-        }
-    };
-
     try {
-        await exec.exec("curl", ["--location", "-s", "https://mcr.microsoft.com/v2/azure-cli/tags/list"], execOptions)
-        if (outStream && JSON.parse(outStream).tags) {
-            return JSON.parse(outStream).tags;
+        const response = await fetch(AZ_CLI_TAG_lIST_URL);
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP error! status: ${response.status}, errorText: ${errorText}`);
         }
-    } catch (error) {
-        // if output is 404 page not found, please verify the url
-        core.warning(`Unable to fetch all az cli versions, please report it as an issue on https://github.com/Azure/CLI/issues. Output: ${outStream}, Error: ${error}`);
+        const data = await response.json();
+        if (data && data.tags) {
+            return data.tags;
+        }
+        else {
+            throw new Error('Response data does not contain tags.');
+        }
+    }
+    catch (error) {
+        core.warning(`Unable to fetch all az cli versions with Error: ${error}. Skipping the version check.`);
     }
     return [];
-}
+};
 
 const executeDockerCommand = async (args: string[], continueOnError: boolean = false): Promise<void> => {
-
     const dockerTool: string = await io.which("docker", true);
     var errorStream: string = '';
     var shouldOutputErrorStream: boolean = false;
